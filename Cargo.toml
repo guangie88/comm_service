@@ -1,6 +1,6 @@
 [package]
 name = "comm_service"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Chen Weiguang <chen.weiguang@gmail.com>"]
 
 [dependencies]

@@ -473,10 +473,8 @@ fn run() -> Result<()> {
         });
     };
 
-    println!("Anticipating logger initialization failure due to re-initialization...");
-
-    // set up the server
-    rocket::custom(rocket_config, true)
+    // set up the server and do not reinitialize the logging system
+    rocket::custom(rocket_config, false)
         .manage(config)
         .manage(ClientMap::new(HashMap::new()))
         .mount("/", routes![ping, execute, executenb, shutdown]).launch();
