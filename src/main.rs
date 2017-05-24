@@ -32,7 +32,7 @@ use futures_cpupool::CpuPool;
 use hyper::client::Client;
 use hyper::header::ContentType;
 use regex::Regex;
-use rouille::{Request, Response};
+use rouille::{HeadersIter, Request, Response};
 use std::boxed::FnBox;
 use std::collections::HashMap;
 use std::error::Error;
@@ -122,6 +122,8 @@ mod errors {
 }
 
 use errors::*;
+
+const JSON_HEADER: &str = "application/json";
 
 macro_rules! create_fut {
     ($pool:expr, $timeout:expr, $action:expr) => {{
@@ -383,42 +385,79 @@ struct MainConfig {
 }
 
 // provide a more descriptive error when 400 (bad request) is returned
-macro_rules! try_or_400_chain_err {
+macro_rules! try_or_400_chain {
+    // Result
     ($res:expr) => {{
         match $res {
             Ok(v) => v,
             Err(e) => {
-                return Response::text(format!("{:?}", e))
+                let err_msg = format!("{:?}", e);
+                error!("{}", err_msg);
+                return Response::text(err_msg)
+                    .with_status_code(400)
+            },
+        }
+    }};
+
+    // Option with message
+    ($opt:expr, $msg:expr) => {{
+        match $opt {
+            Some(v) => v,
+            None => {
+                let err_msg = format!("{}", $msg);
+                error!("{}", err_msg);
+                return Response::text(err_msg)
                     .with_status_code(400)
             },
         }
     }};
 }
 
+macro_rules! true_or_400_chain {
+    // boolean with message
+    ($flag:expr, $msg:expr) => {{
+        if $flag {
+            ()
+        } else {
+            let err_msg = format!("{}", $msg);
+            error!("{}", err_msg);
+            return Response::text(err_msg)
+                .with_status_code(400)
+        }
+    }};
+}
+
+fn is_json_header(mut headers: HeadersIter) -> bool {
+    headers.any(|(key, value)| {
+        key.to_lowercase().contains("content-type") && value.contains(JSON_HEADER)
+    })
+}
+
 // ensure that the input is of intended JSON form
 macro_rules! json_or_400 {
     ($request:expr) => {{
-        let body = {
-            let mut req_body = match $request.data() {
-                Some(req_body) => req_body,
-                None => return Response::empty_400(),
-            };
+        true_or_400_chain!(is_json_header($request.headers()),
+            "Invalid request header for JSON content");
 
+        let body = {
+            let mut req_body = try_or_400_chain!($request.data(), "Invalid JSON data provided");
             let mut s = String::new();
-            try_or_400_chain_err!(req_body.read_to_string(&mut s));
+            try_or_400_chain!(req_body.read_to_string(&mut s));
             s
         };
 
-        try_or_400_chain_err!(serde_json::from_str(&body))
+        try_or_400_chain!(serde_json::from_str(&body))
     }};
 }
 
 // ensure that the output is of intended JSON form
 macro_rules! json_rsp_or_400 {
     ($exec:expr) => {{
-        let res = try_or_400_chain_err!($exec);
-        let res_json = try_or_400_chain_err!(serde_json::to_string(&res));
+        let res = try_or_400_chain!($exec);
+        let res_json = try_or_400_chain!(serde_json::to_string(&res));
+
         Response::text(res_json)
+            .with_additional_header("Content-Type", JSON_HEADER)
     }};
 }
 
@@ -445,7 +484,9 @@ fn route(request: &Request, config: Arc<MainConfig>, client_map: Arc<RwLock<Clie
         },
 
         _ => {
-            let err_msg = format!("URL does not exist or invalid method used!");
+            let err_msg = format!("{} does not exist, or invalid method ({}) used!",
+                request.url(), request.method());
+
             error!("{}", err_msg);
             Response::text(err_msg).with_status_code(404)
         }
