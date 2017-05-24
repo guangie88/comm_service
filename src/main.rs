@@ -1,10 +1,10 @@
 #![feature(fnbox)]
-#![feature(plugin)]
-#![plugin(rocket_codegen)]
+
+#[macro_use]
+extern crate derive_new;
 
 #[macro_use]
 extern crate error_chain;
-
 extern crate futures;
 extern crate futures_cpupool;
 extern crate hyper;
@@ -13,19 +13,18 @@ extern crate hyper;
 extern crate log;
 extern crate log4rs;
 extern crate regex;
-extern crate rocket;
-extern crate rocket_contrib;
+
+#[macro_use]
+extern crate rouille;
 extern crate tokio_timer;
 
 #[macro_use]
 extern crate serde_derive;
-
 extern crate serde_json;
 extern crate structopt;
 
 #[macro_use]
 extern crate structopt_derive;
-
 extern crate url;
 
 use futures::Future;
@@ -33,9 +32,7 @@ use futures_cpupool::CpuPool;
 use hyper::client::Client;
 use hyper::header::ContentType;
 use regex::Regex;
-use rocket::config::{Config, Environment};
-use rocket::State;
-use rocket_contrib::JSON;
+use rouille::{Request, Response};
 use std::boxed::FnBox;
 use std::collections::HashMap;
 use std::error::Error;
@@ -43,25 +40,17 @@ use std::io::{self, Read, Write};
 use std::iter;
 use std::process::{self, Command};
 use std::net::{SocketAddr};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio_timer::Timer;
 use url::Url;
 
-// while obviously it is better to use Scheme as an enum
-// it needs to be in integer
-
-// #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-// enum Scheme {
-//     Http,
-//     Https,
-// }
-
 type Scheme = i32;
-
 const HTTP: i32 = 0;
+
+// not in use
 // const HTTPS: i32 = 1;
 // const INVALID: i32 = 2;
 
@@ -73,7 +62,7 @@ struct ExecReq {
     cmd: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, new)]
 #[serde(rename_all = "camelCase")]
 struct PingReq {
     id: String,
@@ -81,7 +70,7 @@ struct PingReq {
     port: u16,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, new)]
 #[serde(rename_all = "camelCase")]
 struct PingRsp {
     server: String,
@@ -109,19 +98,19 @@ struct ClientInfo {
 }
 
 type CommOverallStatus = HashMap<String, CommStatus>;
-type ClientMap = RwLock<HashMap<String, ClientInfo>>;
+type ClientMap = HashMap<String, ClientInfo>;
 
 mod errors {
     error_chain! {
         errors {
-            ClientMapRead {
-                description("error in reading client map")
-                display("error in reading client map")
+            ClientMapReadLock {
+                description("error in locking client map in read mode")
+                display("error in locking client map in read mode")
             }
 
-            ClientMapWrite {
-                description("error in writing to client map")
-                display("error in writing to client map")
+            ClientMapWriteLock {
+                description("error in locking client map in write mode")
+                display("error in locking client map in write mode")
             }
 
             Timeout {
@@ -133,32 +122,6 @@ mod errors {
 }
 
 use errors::*;
-
-#[post("/ping", data = "<ping_req>")]
-fn ping(socket_addr: SocketAddr, config: State<MainConfig>, client_map: State<ClientMap>, ping_req: JSON<PingReq>) -> Result<JSON<PingRsp>> {
-    info!("Received ping from: {:?} with client name '{}'", socket_addr, ping_req.id);
-
-    match client_map.write() {
-        Ok(mut client_map) => {
-            client_map.insert(ping_req.id.clone(), ClientInfo {
-                scheme: ping_req.scheme,
-                url: {
-                    Url::parse(&format!("http://{}:{}", socket_addr.ip(), ping_req.port))
-                        .chain_err(|| "Unable to parse the base URL for client map!")?
-                },
-            });
-
-            Ok(JSON(PingRsp {
-                server: config.name.to_owned(),
-            }))
-        },
-
-        Err(_) => {
-            error!("Unable to write into client map!");
-            bail!(ErrorKind::ClientMapWrite)
-        },
-    }
-}
 
 macro_rules! create_fut {
     ($pool:expr, $timeout:expr, $action:expr) => {{
@@ -182,7 +145,28 @@ macro_rules! create_fut {
     }};
 }
 
-fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<Option<CommOverallStatus>> {
+fn ping(socket_addr: &SocketAddr, config: Arc<MainConfig>, client_map: Arc<RwLock<ClientMap>>, ping_req: PingReq) -> Result<PingRsp> {
+    info!("Received /ping from: {:?} with client name '{}'", socket_addr, ping_req.id);
+
+    match client_map.write() {
+        Ok(mut client_map) => {
+            client_map.insert(ping_req.id.clone(), ClientInfo {
+                scheme: ping_req.scheme,
+                url: Url::parse(&format!("http://{}:{}", socket_addr.ip(), ping_req.port))
+                    .chain_err(|| "Unable to parse the base URL for client map!")?,
+            });
+
+            Ok(PingRsp::new(config.name.to_owned()))
+        },
+
+        Err(_) => {
+            error!("Unable to write into client map!");
+            bail!(ErrorKind::ClientMapWriteLock)
+        },
+    }
+}
+
+fn execute_impl(is_blocking: bool, config: Arc<MainConfig>, client_map: Arc<RwLock<ClientMap>>, exec_req: ExecReq) -> Result<Option<CommOverallStatus>> {
     let timeout = Duration::from_millis(config.timeout as u64);
     let pool = CpuPool::new(config.thread_count as usize);
 
@@ -351,32 +335,21 @@ fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<
         }
     } else {
         error!("Unable to read from client map!");
-        bail!(ErrorKind::ClientMapRead);
+        bail!(ErrorKind::ClientMapReadLock);
     }
 }
 
-#[post("/execute", data = "<exec_req>")]
-fn execute(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<Option<JSON<CommOverallStatus>>> {
+fn execute(config: Arc<MainConfig>, client_map: Arc<RwLock<ClientMap>>, exec_req: ExecReq) -> Result<Option<CommOverallStatus>> {
     info!("Received /execute: {:?}", exec_req);
     execute_impl(true, config, client_map, exec_req)
-        .map(|comm_overall_status| {
-            match comm_overall_status {
-                Some(comm_overall_status) => Some(JSON(comm_overall_status)),
-                None => None,
-            }
-        })
 }
 
-#[post("/executenb", data = "<exec_req>")]
-fn executenb(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<()> {
+fn executenb(config: Arc<MainConfig>, client_map: Arc<RwLock<ClientMap>>, exec_req: ExecReq) -> Result<()> {
     info!("Received /executenb: {:?}", exec_req);
-
-    execute_impl(false, config, client_map, exec_req)
-        .map(|_| ())
+    execute_impl(false, config, client_map, exec_req).map(|_| ())
 }
 
-#[post("/shutdown", data = "<exec_req>")]
-fn shutdown(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<()> {
+fn shutdown(config: Arc<MainConfig>, client_map: Arc<RwLock<ClientMap>>, exec_req: ExecReq) -> Result<()> {
     info!("Received /shutdown: {:?}", exec_req);
     executenb(config, client_map, exec_req)
 }
@@ -409,6 +382,76 @@ struct MainConfig {
     log_config_path: String,
 }
 
+// provide a more descriptive error when 400 (bad request) is returned
+macro_rules! try_or_400_chain_err {
+    ($res:expr) => {{
+        match $res {
+            Ok(v) => v,
+            Err(e) => {
+                return Response::text(format!("{:?}", e))
+                    .with_status_code(400)
+            },
+        }
+    }};
+}
+
+// ensure that the input is of intended JSON form
+macro_rules! json_or_400 {
+    ($request:expr) => {{
+        let body = {
+            let mut req_body = match $request.data() {
+                Some(req_body) => req_body,
+                None => return Response::empty_400(),
+            };
+
+            let mut s = String::new();
+            try_or_400_chain_err!(req_body.read_to_string(&mut s));
+            s
+        };
+
+        try_or_400_chain_err!(serde_json::from_str(&body))
+    }};
+}
+
+// ensure that the output is of intended JSON form
+macro_rules! json_rsp_or_400 {
+    ($exec:expr) => {{
+        let res = try_or_400_chain_err!($exec);
+        let res_json = try_or_400_chain_err!(serde_json::to_string(&res));
+        Response::text(res_json)
+    }};
+}
+
+fn route(request: &Request, config: Arc<MainConfig>, client_map: Arc<RwLock<ClientMap>>) -> Response {
+    router!(request,
+        (POST) (/ping) => {
+            let ping_req: PingReq = json_or_400!(&request);
+            json_rsp_or_400!(ping(request.remote_addr(), config.clone(), client_map.clone(), ping_req))
+        },
+
+        (POST) (/execute) => {
+            let exec_req: ExecReq = json_or_400!(&request);
+            json_rsp_or_400!(execute(config.clone(), client_map.clone(), exec_req))
+        },
+
+        (POST) (/executenb) => {
+            let exec_req: ExecReq = json_or_400!(&request);
+            json_rsp_or_400!(executenb(config.clone(), client_map.clone(), exec_req))
+        },
+
+        (POST) (/shutdown) => {
+            let exec_req: ExecReq = json_or_400!(&request);
+            json_rsp_or_400!(shutdown(config.clone(), client_map.clone(), exec_req))
+        },
+
+        _ => {
+            let err_msg = format!("URL does not exist or invalid method used!");
+            error!("{}", err_msg);
+            Response::text(err_msg).with_status_code(404)
+        }
+    )
+}
+
 fn run() -> Result<()> {
     let config = MainConfig::from_args();
 
@@ -416,12 +459,6 @@ fn run() -> Result<()> {
        .chain_err(|| format!("Unable to initialize log4rs logger with the given config file at '{}'", config.log_config_path))?;
 
     info!("Config: {:?}", config);
-
-    let rocket_config = Config::build(Environment::Production)
-        .address(config.address.to_owned())
-        .port(config.port)
-        .finalize()
-        .chain_err(|| "Unable to create the custom rocket configuration!")?;
 
     // set up pinger (client)
     if let Some(ref ping_to) = config.ping_to {
@@ -435,13 +472,7 @@ fn run() -> Result<()> {
 
         thread::spawn(move || {
             let client = Client::new();
-
-            let ping_req = PingReq {
-                id: name,
-                scheme: HTTP,
-                port: port,
-            };
-
+            let ping_req = PingReq::new(name, HTTP, port);
             let ping_req_str = serde_json::to_string(&ping_req);
 
             match ping_req_str {
@@ -473,13 +504,19 @@ fn run() -> Result<()> {
         });
     };
 
-    // set up the server and do not reinitialize the logging system
-    rocket::custom(rocket_config, false)
-        .manage(config)
-        .manage(ClientMap::new(HashMap::new()))
-        .mount("/", routes![ping, execute, executenb, shutdown]).launch();
+    let listening_sockaddr = format!("{}:{}", config.address, config.port);
+    let listening_sockaddr_log = listening_sockaddr.clone();
 
-    Ok(())
+    let config = Arc::new(config);
+    let client_map = Arc::new(RwLock::new(ClientMap::new()));
+
+    info!("Communication server starting at {}", listening_sockaddr_log);
+
+    rouille::start_server(&listening_sockaddr, move |request| {
+        let config = config.clone();
+        let client_map = client_map.clone();
+        route(&request, config, client_map)
+    });
 }
 
 fn main() {
