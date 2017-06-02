@@ -11,12 +11,12 @@ hyper = { version = "0.10", default-features = false }
 log = "0.3"
 log4rs = "0.6"
 regex = "0.2"
-rocket = "=0.2.6"
-rocket_codegen = "=0.2.6"
-rocket_contrib = "=0.2.6"
-serde = "0.9"
-serde_derive = "0.9"
-serde_json = "0.9"
+rocket = { git = "https://github.com/SergioBenitez/Rocket.git", branch = "master" }
+rocket_codegen = { git = "https://github.com/SergioBenitez/Rocket.git", branch = "master" }
+rocket_contrib = { git = "https://github.com/SergioBenitez/Rocket.git", branch = "master" }
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
 structopt = "0.0"
 structopt-derive = "0.0"
 tokio-timer = "0.1"
