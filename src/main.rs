@@ -243,8 +243,8 @@ fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<
             create_fut!(pool, timeout, move || -> Result<Option<CommOverallStatus>> {
                 let child = if cfg!(target_os = "windows") {
                     Command::new("cmd")
-                       .args(&["/C", &cmd])
-                       .output()
+                        .args(&["/C", &cmd])
+                        .output()
                 } else {
                     Command::new("sh")
                         .args(&["-c", &cmd])
@@ -413,7 +413,7 @@ fn run() -> Result<()> {
     let config = MainConfig::from_args();
 
     log4rs::init_file(&config.log_config_path, Default::default())
-       .chain_err(|| format!("Unable to initialize log4rs logger with the given config file at '{}'", config.log_config_path))?;
+        .chain_err(|| format!("Unable to initialize log4rs logger with the given config file at '{}'", config.log_config_path))?;
 
     info!("Config: {:?}", config);
 
