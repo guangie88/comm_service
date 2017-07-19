@@ -35,7 +35,7 @@ use hyper::header::ContentType;
 use regex::Regex;
 use rocket::config::{Config, Environment};
 use rocket::State;
-use rocket_contrib::JSON;
+use rocket_contrib::Json;
 use std::boxed::FnBox;
 use std::collections::HashMap;
 use std::error::Error;
@@ -135,7 +135,7 @@ mod errors {
 use errors::*;
 
 #[post("/ping", data = "<ping_req>")]
-fn ping(socket_addr: SocketAddr, config: State<MainConfig>, client_map: State<ClientMap>, ping_req: JSON<PingReq>) -> Result<JSON<PingRsp>> {
+fn ping(socket_addr: SocketAddr, config: State<MainConfig>, client_map: State<ClientMap>, ping_req: Json<PingReq>) -> Result<Json<PingRsp>> {
     info!("Received ping from: {:?} with client name '{}'", socket_addr, ping_req.id);
 
     match client_map.write() {
@@ -148,7 +148,7 @@ fn ping(socket_addr: SocketAddr, config: State<MainConfig>, client_map: State<Cl
                 },
             });
 
-            Ok(JSON(PingRsp {
+            Ok(Json(PingRsp {
                 server: config.name.to_owned(),
             }))
         },
@@ -182,7 +182,7 @@ macro_rules! create_fut {
     }};
 }
 
-fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<Option<CommOverallStatus>> {
+fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<ClientMap>, exec_req: Json<ExecReq>) -> Result<Option<CommOverallStatus>> {
     let timeout = Duration::from_millis(config.timeout as u64);
     let pool = CpuPool::new(config.thread_count as usize);
 
@@ -208,7 +208,7 @@ fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<
                     let client = Client::new();
 
                     let mut res = client.post(client_execute_url)
-                        .body(&serde_json::to_string(&exec_req).chain_err(|| "Unable to convert execution request JSON into string")?)
+                        .body(&serde_json::to_string(&exec_req).chain_err(|| "Unable to convert execution request Json into string")?)
                         .header(ContentType::json())
                         .send()
                         .chain_err(|| "Unable to perform client post")?;
@@ -356,19 +356,19 @@ fn execute_impl(is_blocking: bool, config: State<MainConfig>, client_map: State<
 }
 
 #[post("/execute", data = "<exec_req>")]
-fn execute(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<Option<JSON<CommOverallStatus>>> {
+fn execute(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: Json<ExecReq>) -> Result<Option<Json<CommOverallStatus>>> {
     info!("Received /execute: {:?}", exec_req);
     execute_impl(true, config, client_map, exec_req)
         .map(|comm_overall_status| {
             match comm_overall_status {
-                Some(comm_overall_status) => Some(JSON(comm_overall_status)),
+                Some(comm_overall_status) => Some(Json(comm_overall_status)),
                 None => None,
             }
         })
 }
 
 #[post("/executenb", data = "<exec_req>")]
-fn executenb(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<()> {
+fn executenb(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: Json<ExecReq>) -> Result<()> {
     info!("Received /executenb: {:?}", exec_req);
 
     execute_impl(false, config, client_map, exec_req)
@@ -376,7 +376,7 @@ fn executenb(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: 
 }
 
 #[post("/shutdown", data = "<exec_req>")]
-fn shutdown(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: JSON<ExecReq>) -> Result<()> {
+fn shutdown(config: State<MainConfig>, client_map: State<ClientMap>, exec_req: Json<ExecReq>) -> Result<()> {
     info!("Received /shutdown: {:?}", exec_req);
     executenb(config, client_map, exec_req)
 }
