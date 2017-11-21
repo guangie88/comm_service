@@ -2,8 +2,10 @@
 #![feature(plugin)]
 #![plugin(rocket_codegen)]
 
+extern crate failure;
+
 #[macro_use]
-extern crate error_chain;
+extern crate failure_derive;
 
 extern crate futures;
 extern crate futures_cpupool;
@@ -28,6 +30,7 @@ extern crate structopt_derive;
 
 extern crate url;
 
+use failure::Error as FailError;
 use futures::Future;
 use futures_cpupool::CpuPool;
 use hyper::client::Client;
@@ -64,6 +67,8 @@ type Scheme = i32;
 const HTTP: i32 = 0;
 // const HTTPS: i32 = 1;
 // const INVALID: i32 = 2;
+
+type Result<T> = std::result::Result<T, FailError>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -111,56 +116,49 @@ struct ClientInfo {
 type CommOverallStatus = HashMap<String, CommStatus>;
 type ClientMap = RwLock<HashMap<String, ClientInfo>>;
 
-mod errors {
-    error_chain! {
-        errors {
-            ClientMapRead {
-                description("error in reading client map")
-                display("error in reading client map")
-            }
+#[derive(Debug, Fail)]
+enum MainError {
+    #[fail(display = "error in reading client map")]
+    ClientMapRead,
 
-            ClientMapWrite {
-                description("error in writing to client map")
-                display("error in writing to client map")
-            }
+    #[fail(display = "error in writing to client map")]
+    ClientMapWrite,
 
-            Timeout {
-                description("execution timeout")
-                display("execution timeout")
-            }
-        }
-    }
+    #[fail(display = "execution timeout")]
+    Timeout,
 }
 
-use errors::*;
-
 #[post("/ping", data = "<ping_req>")]
-fn ping(socket_addr: SocketAddr,
-        config: State<MainConfig>,
-        client_map: State<ClientMap>,
-        ping_req: Json<PingReq>)
-        -> Result<Json<PingRsp>> {
-    info!("Received ping from: {:?} with client name '{}'",
-          socket_addr,
-          ping_req.id);
+fn ping(
+    socket_addr: SocketAddr,
+    config: State<MainConfig>,
+    client_map: State<ClientMap>,
+    ping_req: Json<PingReq>,
+) -> Result<Json<PingRsp>> {
+    info!(
+        "Received ping from: {:?} with client name '{}'",
+        socket_addr,
+        ping_req.id
+    );
 
     match client_map.write() {
         Ok(mut client_map) => {
-            client_map.insert(ping_req.id.clone(),
-                              ClientInfo {
-                                  scheme: ping_req.scheme,
-                                  url: {
-                                      Url::parse(&format!("http://{}:{}", socket_addr.ip(), ping_req.port))
-                                          .chain_err(|| "Unable to parse the base URL for client map!")?
-                                  },
-                              });
+            client_map.insert(
+                ping_req.id.clone(),
+                ClientInfo {
+                    scheme: ping_req.scheme,
+                    url: {
+                        Url::parse(&format!("http://{}:{}", socket_addr.ip(), ping_req.port))?
+                    },
+                },
+            );
 
             Ok(Json(PingRsp { server: config.name.to_owned() }))
         }
 
         Err(_) => {
             error!("Unable to write into client map!");
-            bail!(ErrorKind::ClientMapWrite)
+            Err(MainError::ClientMapWrite)?
         }
     }
 }
@@ -174,7 +172,8 @@ macro_rules! create_fut {
         // furthermore must explicit type out the Send so that the inner type remains as Send
         // throughout passing around into other stuff
 
-        let bail_fn: Box<FnBox(_) -> _ + Send> = Box::new(|_| bail!(ErrorKind::Timeout));
+        let bail_fn: Box<FnBox(_) -> _ + Send> = Box::new(
+            |_| Err(FailError::from(MainError::Timeout)));
 
         let timeout_fut = timer.sleep($timeout)
             .then(bail_fn);
@@ -187,11 +186,12 @@ macro_rules! create_fut {
     }};
 }
 
-fn execute_impl(is_blocking: bool,
-                config: State<MainConfig>,
-                client_map: State<ClientMap>,
-                exec_req: Json<ExecReq>)
-                -> Result<Option<CommOverallStatus>> {
+fn execute_impl(
+    is_blocking: bool,
+    config: State<MainConfig>,
+    client_map: State<ClientMap>,
+    exec_req: Json<ExecReq>,
+) -> Result<Option<CommOverallStatus>> {
     let timeout = Duration::from_millis(config.timeout as u64);
     let pool = CpuPool::new(config.thread_count as usize);
 
@@ -199,56 +199,52 @@ fn execute_impl(is_blocking: bool,
         // broadcast and execute for each client
         info!("Broadcasting commands to each client...");
 
-        let client_comm_overall_status_futs: Vec<_> = client_map
-            .iter()
-            .map(|(client_name, client_info)| {
-                let client_execute_url = {
-                    let mut url = client_info.url.clone();
-                    let path = if is_blocking { "execute" } else { "executenb" };
-                    url.set_path(path);
-                    url
-                };
+        let client_comm_overall_status_futs = client_map.iter().map(|(client_name, client_info)| {
+            let client_execute_url = {
+                let mut url = client_info.url.clone();
+                let path = if is_blocking { "execute" } else { "executenb" };
+                url.set_path(path);
+                url
+            };
 
-                let exec_req = exec_req.clone();
-                let client_name = client_name.to_owned();
+            let exec_req = exec_req.clone();
+            let client_name = client_name.to_owned();
 
-                info!("Broadcasting '{:?}' for client '{}' to '{}'...",
-                      exec_req,
-                      client_name,
-                      client_execute_url);
+            info!(
+                "Broadcasting '{:?}' for client '{}' to '{}'...",
+                exec_req,
+                client_name,
+                client_execute_url
+            );
 
-                create_fut!(pool, timeout, move || {
-                    let client = Client::new();
+            create_fut!(pool, timeout, move || {
+                let client = Client::new();
 
-                    let mut res = client
-                        .post(client_execute_url)
-                        .body(&serde_json::to_string(&exec_req)
-                                   .chain_err(|| "Unable to convert execution request Json into string")?)
-                        .header(ContentType::json())
-                        .send()
-                        .chain_err(|| "Unable to perform client post")?;
+                let mut res = client
+                    .post(client_execute_url)
+                    .body(&serde_json::to_string(&exec_req)?)
+                    .header(ContentType::json())
+                    .send()?;
 
-                    let mut rsp_body = String::new();
-                    let _ = res.read_to_string(&mut rsp_body);
+                let mut rsp_body = String::new();
+                let _ = res.read_to_string(&mut rsp_body);
 
-                    info!("Client '{}' response body: {}", client_name, rsp_body);
+                info!("Client '{}' response body: {}", client_name, rsp_body);
 
-                    let partial_comm_overall_status: CommOverallStatus =
-                        serde_json::from_str(&rsp_body)
-                            .chain_err(|| "Unable to parse client response body into comm overall status")?;
+                let partial_comm_overall_status: CommOverallStatus = serde_json::from_str(&rsp_body)?;
 
-                    Ok(Some(partial_comm_overall_status))
-                })
+                Ok(Some(partial_comm_overall_status))
             })
-            .collect();
+        });
 
         // execute for self if matching
-        let client_key = Regex::new(&exec_req.cmd_id_re)
-            .chain_err(|| format!("Unable to parse '{}' as regex", exec_req.cmd_id_re))?;
+        let client_key = Regex::new(&exec_req.cmd_id_re)?;
 
-        info!("Checking for self name '{}' match against regex '{}'...",
-              config.name,
-              client_key);
+        info!(
+            "Checking for self name '{}' match against regex '{}'...",
+            config.name,
+            client_key
+        );
 
         let self_comm_overall_status_fut = if client_key.is_match(&config.name) {
             let cmd = exec_req.cmd.to_owned();
@@ -258,63 +254,63 @@ fn execute_impl(is_blocking: bool,
 
             info!("Name '{}' matches regex, executing '{}'...", name, cmd);
 
-            create_fut!(pool,
-                        timeout,
-                        move || -> Result<Option<CommOverallStatus>> {
-                let child = if cfg!(target_os = "windows") {
-                    Command::new("cmd").args(&["/C", &cmd]).output()
-                } else {
-                    Command::new("sh").args(&["-c", &cmd]).output()
-                };
+            create_fut!(
+                pool,
+                timeout,
+                move || -> Result<Option<CommOverallStatus>> {
+                    let child = if cfg!(target_os = "windows") {
+                        Command::new("cmd").args(&["/C", &cmd]).output()
+                    } else {
+                        Command::new("sh").args(&["-c", &cmd]).output()
+                    };
 
-                const ERROR_EXIT_CODE: i32 = 127;
+                    const ERROR_EXIT_CODE: i32 = 127;
 
-                let self_comm_status = match child {
-                    Ok(child) => {
-                        let exit_code = match child.status.code() {
-                            Some(code) => code,
-                            None => ERROR_EXIT_CODE,
-                        };
+                    let self_comm_status = match child {
+                        Ok(child) => {
+                            let exit_code = match child.status.code() {
+                                Some(code) => code,
+                                None => ERROR_EXIT_CODE,
+                            };
 
-                        CommStatus {
-                            exit_code: exit_code,
-                            stdout: Some(String::from_utf8_lossy(&child.stdout).to_string()),
-                            stderr: Some(String::from_utf8_lossy(&child.stderr).to_string()),
-                            hostname: address,
-                            port: port,
+                            CommStatus {
+                                exit_code: exit_code,
+                                stdout: Some(String::from_utf8_lossy(&child.stdout).to_string()),
+                                stderr: Some(String::from_utf8_lossy(&child.stderr).to_string()),
+                                hostname: address,
+                                port: port,
+                            }
                         }
-                    }
 
-                    Err(e) => {
-                        CommStatus {
+                        Err(e) => CommStatus {
                             exit_code: ERROR_EXIT_CODE,
                             stdout: None,
                             stderr: Some(e.description().to_owned()),
                             hostname: address,
                             port: port,
-                        }
-                    }
-                };
+                        },
+                    };
 
-                let mut partial_comm_overall_status = CommOverallStatus::new();
-                partial_comm_overall_status.insert(name, self_comm_status);
-                Ok(Some(partial_comm_overall_status))
-            })
+                    let mut partial_comm_overall_status = CommOverallStatus::new();
+                    partial_comm_overall_status.insert(name, self_comm_status);
+                    Ok(Some(partial_comm_overall_status))
+                }
+            )
         } else {
-            info!("Name '{}' does not match regex, returning None...",
-                  config.name);
+            info!(
+                "Name '{}' does not match regex, returning None...",
+                config.name
+            );
 
-            create_fut!(pool,
-                        timeout,
-                        || -> Result<Option<CommOverallStatus>> { Ok(None) })
+            create_fut!(pool, timeout, || -> Result<Option<CommOverallStatus>> {
+                Ok(None)
+            })
         };
 
         // merge all the results
         info!("Merging results from broadcast and self-execution...");
 
-        let comm_overall_status_futs = client_comm_overall_status_futs
-            .into_iter()
-            .chain(iter::once(self_comm_overall_status_fut));
+        let comm_overall_status_futs = client_comm_overall_status_futs.chain(iter::once(self_comm_overall_status_fut));
 
         // handle future results based on the type of execution
         if is_blocking {
@@ -335,14 +331,16 @@ fn execute_impl(is_blocking: bool,
                             const OTHER_ERROR_EXIT_CODE: i32 = 126;
                             let mut partial_comm_overall_status = CommOverallStatus::new();
 
-                            partial_comm_overall_status.insert(config.name.to_owned(),
-                                                               CommStatus {
-                                                                   exit_code: OTHER_ERROR_EXIT_CODE,
-                                                                   stdout: None,
-                                                                   stderr: Some(format!("{}", e)),
-                                                                   hostname: config.address.to_owned(),
-                                                                   port: config.port,
-                                                               });
+                            partial_comm_overall_status.insert(
+                                config.name.to_owned(),
+                                CommStatus {
+                                    exit_code: OTHER_ERROR_EXIT_CODE,
+                                    stdout: None,
+                                    stderr: Some(format!("{}", e)),
+                                    hostname: config.address.to_owned(),
+                                    port: config.port,
+                                },
+                            );
 
                             Some(partial_comm_overall_status)
                         }
@@ -351,7 +349,9 @@ fn execute_impl(is_blocking: bool,
                         _ => None,
                     }
                 })
-                .flat_map(|partial_comm_overall_status| partial_comm_overall_status.into_iter())
+                .flat_map(|partial_comm_overall_status| {
+                    partial_comm_overall_status.into_iter()
+                })
                 .collect();
 
             info!("Done waiting, overall status: {:?}", comm_overall_status);
@@ -368,22 +368,21 @@ fn execute_impl(is_blocking: bool,
         }
     } else {
         error!("Unable to read from client map!");
-        bail!(ErrorKind::ClientMapRead);
+        Err(MainError::ClientMapRead)?
     }
 }
 
 #[post("/execute", data = "<exec_req>")]
-fn execute(config: State<MainConfig>,
-           client_map: State<ClientMap>,
-           exec_req: Json<ExecReq>)
-           -> Result<Option<Json<CommOverallStatus>>> {
+fn execute(
+    config: State<MainConfig>,
+    client_map: State<ClientMap>,
+    exec_req: Json<ExecReq>,
+) -> Result<Option<Json<CommOverallStatus>>> {
     info!("Received /execute: {:?}", exec_req);
     execute_impl(true, config, client_map, exec_req).map(|comm_overall_status| match comm_overall_status {
-                                                             Some(comm_overall_status) => {
-                                                                 Some(Json(comm_overall_status))
-                                                             }
-                                                             None => None,
-                                                         })
+        Some(comm_overall_status) => Some(Json(comm_overall_status)),
+        None => None,
+    })
 }
 
 #[post("/executenb", data = "<exec_req>")]
@@ -409,8 +408,7 @@ struct MainConfig {
                 default_value = "30000")]
     timeout: u32,
 
-    #[structopt(short = "a", long = "address", help = "Interface address to host",
-                default_value = "0.0.0.0")]
+    #[structopt(short = "a", long = "address", help = "Interface address to host", default_value = "0.0.0.0")]
     address: String,
 
     #[structopt(short = "p", long = "port", help = "Port to host")]
@@ -419,12 +417,10 @@ struct MainConfig {
     #[structopt(short = "d", long = "ping-to", help = "Server to ping to (optional)")]
     ping_to: Option<Url>,
 
-    #[structopt(short = "i", long = "interval", help = "Ping-to-server interval",
-                default_value = "3000")]
+    #[structopt(short = "i", long = "interval", help = "Ping-to-server interval", default_value = "3000")]
     ping_to_interval: u32,
 
-    #[structopt(short = "c", long = "thread-count", help = "# of threads in cpu pool",
-                default_value = "64")]
+    #[structopt(short = "c", long = "thread-count", help = "# of threads in cpu pool", default_value = "64")]
     thread_count: u32,
 
     #[structopt(short = "l", long = "log-config-path", help = "Log config file path")]
@@ -433,28 +429,19 @@ struct MainConfig {
 
 fn run() -> Result<()> {
     let config = MainConfig::from_args();
-
-    log4rs::init_file(&config.log_config_path, Default::default())
-        .chain_err(|| {
-                       format!("Unable to initialize log4rs logger with the given config file at '{}'",
-                               config.log_config_path)
-                   })?;
+    log4rs::init_file(&config.log_config_path, Default::default())?;
 
     info!("Config: {:?}", config);
 
     let rocket_config = Config::build(Environment::Production)
         .address(config.address.to_owned())
         .port(config.port)
-        .finalize()
-        .chain_err(|| "Unable to create the custom rocket configuration!")?;
+        .finalize()?;
 
     // set up pinger (client)
     if let Some(ref ping_to) = config.ping_to {
         // for moving into looping thread
-        let ping_to = ping_to
-            .clone()
-            .join("/ping")
-            .chain_err(|| "Unable to join /ping to url!")?;
+        let ping_to = ping_to.clone().join("/ping")?;
 
         let ping_to_interval = Duration::from_millis(config.ping_to_interval as u64);
         let name = config.name.to_owned();
@@ -521,11 +508,7 @@ fn main() {
         Err(ref e) => {
             let stderr = &mut io::stderr();
 
-            writeln!(stderr, "Error: {}", e).expect("Unable to write error into stderr!");
-
-            for e in e.iter().skip(1) {
-                writeln!(stderr, "- Caused by: {}", e).expect("Unable to write error causes into stderr!");
-            }
+            writeln!(stderr, "Error: {}, {}", e.cause(), e.backtrace()).expect("Unable to write error into stderr!");
 
             process::exit(1);
         }
